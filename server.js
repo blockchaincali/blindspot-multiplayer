@@ -94,8 +94,9 @@ wss.on('connection',ws=>{
 });
 setInterval(()=>{for(const [code,r] of rooms){
  if(r.phase==='playing'&&Date.now()>=r.endsAt)finish(r,false,'Time expired');
- if(r.beacons.length)r.beacons=r.beacons.filter(b=>b.until>Date.now());
+ const beforeBeacons=r.beacons.length;
+ if(beforeBeacons)r.beacons=r.beacons.filter(b=>b.until>Date.now());
  if(!online(r).length&&r.phase!=='playing')rooms.delete(code);
- else if(r.phase==='playing')publish(r);
+ else if(r.phase==='playing'&&r.beacons.length!==beforeBeacons)publish(r);
 }},1000).unref();
 server.listen(PORT,'0.0.0.0',()=>console.log('BLINDSPOT online port '+PORT));
