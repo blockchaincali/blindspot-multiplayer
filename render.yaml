@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: blindspot-multiplayer
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm install --omit=dev
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
