@@ -14,6 +14,7 @@ const wss=new WebSocketServer({server,path:'/ws'});
 const id=()=>crypto.randomBytes(8).toString('hex');
 const randomCode=()=>Array.from(crypto.randomBytes(4),v=>'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[v%32]).join('');
 const online=r=>r.players.filter(p=>p.ws&&p.ws.readyState===WebSocket.OPEN);
+const bots=r=>r.players.filter(p=>p.bot);
 const send=(p,o)=>{if(p?.ws?.readyState===WebSocket.OPEN)p.ws.send(JSON.stringify(o))};
 const note=(r,msg)=>{r.messages.push({name:'SYSTEM',text:msg});r.messages=r.messages.slice(-30)};
 function maze(){
@@ -40,20 +41,59 @@ function publish(r){
  if(runner)return Math.abs(x-r.position[0])+Math.abs(y-r.position[1])<=2?v:-1;
  return ((x+y+sector*4)%9<6)?v:-1;
  }));
- send(p,{type:'state',code:r.code,me:p.id,hostId:r.hostId,runnerId:r.runnerId,players:r.players.map(({id,name,score,ws})=>({id,name,score,online:!!ws&&ws.readyState===WebSocket.OPEN})),
- phase:r.phase,grid:view,position:r.position,exit:r.exit,fragments:r.fragments,found:r.found,beacons:r.beacons,messages:r.messages,endsAt:r.endsAt,result:r.result,round:r.round,role:runner?'RUNNER':'SCOUT',score:p.score});
+ send(p,{type:'state',code:r.code,me:p.id,hostId:r.hostId,runnerId:r.runnerId,players:r.players.map(({id,name,score,ws,bot})=>({id,name,score,bot:!!bot,online:!!bot||!!ws&&ws.readyState===WebSocket.OPEN})),
+ phase:r.phase,solo:!!r.solo,grid:view,position:r.position,exit:r.exit,fragments:r.fragments,found:r.found,beacons:r.beacons,messages:r.messages,endsAt:r.endsAt,result:r.result,round:r.round,role:runner?'RUNNER':'SCOUT',score:p.score});
  }
 }
 function finish(r,won,reason){if(r.phase!=='playing')return;r.phase='result';r.result={won,reason};if(won){const pts=Math.max(100,Math.floor((r.endsAt-Date.now())/1000)*10);for(const p of r.players)p.score+=pts;note(r,'Mission completed. +' + pts + ' points for the crew!')}else note(r,'Mission failed: '+reason);publish(r)}
+
+function shortestRoute(grid,from,to){
+ const visited=new Set([from.join(',')]);
+ const queue=[[from]];
+ for(let head=0;head<queue.length;head++){
+  const route=queue[head],p=route[route.length-1];
+  if(p[0]===to[0]&&p[1]===to[1])return route;
+  for(const [dx,dy] of [[0,-1],[1,0],[0,1],[-1,0]]){
+   const x=p[0]+dx,y=p[1]+dy,key=x+','+y;
+   if(grid[y]?.[x]!==0||visited.has(key))continue;
+   visited.add(key);queue.push([...route,[x,y]]);
+  }
+ }
+ return null;
+}
+function guideSolo(r,force=false){
+ if(!r.solo||r.phase!=='playing')return;
+ const pending=r.fragments.filter((_,i)=>!r.found.includes(i));
+ const goals=pending.length?pending:[r.exit];
+ const routes=goals.map(goal=>shortestRoute(r.grid,r.position,goal)).filter(Boolean);
+ routes.sort((a,b)=>a.length-b.length);
+ const route=routes[0];
+ if(!route||route.length<2)return;
+ const [nx,ny]=route[1],[x,y]=r.position;
+ const direction=nx>x?'RIGHT':nx<x?'LEFT':ny>y?'DOWN':'UP';
+ const objective=pending.length?'SIGNAL '+(r.found.length+1)+'/3':'EXIT';
+ const marker=r.beacons.find(b=>b.bot);
+ if(marker){marker.x=nx;marker.y=ny;marker.until=Date.now()+12000}
+ else r.beacons.push({x:nx,y:ny,name:'VECTOR 🤖',bot:true,until:Date.now()+12000});
+ r.botSteps=(r.botSteps||0)+1;
+ const advice=direction+' toward '+objective+'. Follow the orange beacon!';
+ if(force||advice!==r.botAdvice||r.botSteps%3===0){
+  r.messages.push({name:'ECHO 🤖',text:advice});
+  r.messages=r.messages.slice(-30);
+  r.botAdvice=advice;
+ }
+}
 function start(r){
- if(online(r).length<2)return false;
- const m=maze();r.grid=m.grid;r.exit=m.exit;r.fragments=m.fragments;r.found=[];r.position=[1,1];r.beacons=[];r.phase='playing';r.endsAt=Date.now()+ROUND;r.result=null;r.round++;r.runnerId=online(r)[(r.round-1)%online(r).length].id;note(r,'Mission launched! Collect the signals and reach the exit.');publish(r);return true;
+ if(online(r).length+bots(r).length<2)return false;
+ const m=maze();r.grid=m.grid;r.exit=m.exit;r.fragments=m.fragments;r.found=[];r.position=[1,1];r.beacons=[];r.phase='playing';r.endsAt=Date.now()+ROUND;r.result=null;r.round++;r.runnerId=online(r)[(r.round-1)%online(r).length].id;r.botSteps=0;r.botAdvice='';
+ note(r,r.solo?'SOLO PRACTICE: ECHO and VECTOR are your bot Scouts. Follow their clues!':'Mission launched! Collect the signals and reach the exit.');
+ guideSolo(r,true);publish(r);return true;
 }
 function join(ws,m){
  const code=String(m.code||'').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,4);
  const name=String(m.name||'Player').replace(/[<>]/g,'').trim().slice(0,18)||'Player';
  const r=rooms.get(code);if(!r)return ws.send(JSON.stringify({type:'error',message:'Room not found'}));
- let p=r.players.find(p=>p.id===m.id);if(!p){if(online(r).length>=6)return ws.send(JSON.stringify({type:'error',message:'Room is full'}));p={id:id(),name,score:0,ws:null};r.players.push(p);}
+ let p=r.players.find(p=>p.id===m.id);if(!p){if(r.players.length>=6)return ws.send(JSON.stringify({type:'error',message:'Room is full'}));p={id:id(),name,score:0,ws:null};r.players.push(p);}
  if(p.ws&&p.ws!==ws)try{p.ws.close()}catch{}
  p.ws=ws;p.name=name;ws.room=code;ws.pid=p.id;if(!r.hostId||!r.players.find(t=>t.id===r.hostId&&t.ws))r.hostId=p.id;
  ws.send(JSON.stringify({type:'joined',code,id:p.id,name}));note(r,name+' joined the crew');publish(r);
@@ -63,7 +103,10 @@ wss.on('connection',ws=>{
  let m;try{if(raw.length>8192)return;m=JSON.parse(raw.toString())}catch{return}
  if(m.type==='create'){
  let code=randomCode();while(rooms.has(code))code=randomCode();
- rooms.set(code,{code,hostId:null,runnerId:null,players:[],phase:'lobby',grid:null,round:0,found:[],fragments:[],beacons:[],messages:[],endsAt:0,result:null});join(ws,{...m,code});return;
+ rooms.set(code,{code,hostId:null,runnerId:null,players:[],solo:!!m.solo,phase:'lobby',grid:null,round:0,found:[],fragments:[],beacons:[],messages:[],endsAt:0,result:null});
+ join(ws,{...m,code});
+ if(m.solo){const r=rooms.get(code);r.players.push({id:'bot-'+id(),name:'ECHO 🤖',score:0,ws:null,bot:true},{id:'bot-'+id(),name:'VECTOR 🤖',score:0,ws:null,bot:true});start(r)}
+ return;
  }
  if(m.type==='join'){join(ws,m);return}
  const r=rooms.get(ws.room);if(!r)return;
@@ -77,7 +120,7 @@ wss.on('connection',ws=>{
   r.position=[x,y];const ix=r.fragments.findIndex(q=>q[0]===x&&q[1]===y);
   if(ix!==-1&&!r.found.includes(ix)){r.found.push(ix);note(r,'Signal fragment secured ('+r.found.length+'/3)')}
   if(x===r.exit[0]&&y===r.exit[1]&&r.found.length===3)finish(r,true,'Escaped!');
-  else publish(r);
+  else {guideSolo(r,ix!==-1);publish(r)}
  }
  else if(m.type==='beacon'&&r.phase==='playing'&&p.id!==r.runnerId){
   const x=Number(m.x),y=Number(m.y);
