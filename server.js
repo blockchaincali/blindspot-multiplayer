@@ -1,145 +1,153 @@
 'use strict';
-const http=require('http'),crypto=require('crypto'),fs=require('fs'),path=require('path');
-const {WebSocketServer,WebSocket}=require('ws');
-const PORT=Number(process.env.PORT||3000),rooms=new Map(),SIZE=13,ROUND=180000;
-const root=path.join(__dirname,'public');
-const server=http.createServer((req,res)=>{
-  const u=new URL(req.url,'http://localhost');
-  if(u.pathname==='/healthz'){res.writeHead(200,{'Content-Type':'application/json'});return res.end(JSON.stringify({status:'ok'}));}
-  const f={'/':'index.html','/index.html':'index.html','/style.css':'style.css','/app.js':'app.js','/favicon.svg':'favicon.svg'}[u.pathname];
-  if(!f){res.writeHead(404);return res.end('Not found');}
-  fs.readFile(path.join(root,f),(err,data)=>{if(err){res.writeHead(404);return res.end('Not found');}res.writeHead(200,{'Content-Type':({html:'text/html; charset=utf-8',css:'text/css',js:'text/javascript',svg:'image/svg+xml'})[f.split('.').at(-1)],'Cache-Control':'no-store'});res.end(data)});
-});
-const wss=new WebSocketServer({server,path:'/ws'});
-const id=()=>crypto.randomBytes(8).toString('hex');
-const randomCode=()=>Array.from(crypto.randomBytes(4),v=>'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[v%32]).join('');
-const online=r=>r.players.filter(p=>p.ws&&p.ws.readyState===WebSocket.OPEN);
-const bots=r=>r.players.filter(p=>p.bot);
-const send=(p,o)=>{if(p?.ws?.readyState===WebSocket.OPEN)p.ws.send(JSON.stringify(o))};
-const note=(r,msg)=>{r.messages.push({name:'SYSTEM',text:msg});r.messages=r.messages.slice(-30)};
-function maze(){
- let a=Array.from({length:SIZE},()=>Array(SIZE).fill(1));
- const stack=[[1,1]];a[1][1]=0;
- while(stack.length){
-  const [x,y]=stack.at(-1);
-  const options=[[2,0],[-2,0],[0,2],[0,-2]].map(([dx,dy])=>[x+dx,y+dy,dx,dy]).filter(([nx,ny])=>nx>0&&ny>0&&nx<SIZE-1&&ny<SIZE-1&&a[ny][nx]);
-  if(!options.length){stack.pop();continue}
-  const [nx,ny,dx,dy]=options[Math.floor(Math.random()*options.length)];
-  a[y+dy/2][x+dx/2]=0;a[ny][nx]=0;stack.push([nx,ny]);
- }
- const open=[];a.forEach((row,y)=>row.forEach((v,x)=>{if(!v&&!(x===1&&y===1))open.push([x,y])}));
- open.sort(()=>Math.random()-.5);
- return {grid:a,exit:[SIZE-2,SIZE-2],fragments:open.filter(([x,y])=>!(x===SIZE-2&&y===SIZE-2)).slice(0,3)};
+const http=require('node:http'), fs=require('node:fs'), path=require('node:path'), crypto=require('node:crypto');
+const {WebSocket,WebSocketServer}=require('ws');
+const PORT=Number(process.env.PORT||3000), W=900,H=540, LIMIT=90000, TICK=100, rooms=new Map();
+const names=['VEX','NOVA','BYTE','FURY','ZAP','KIRA'], colors=['#48f6d3','#fd6db5','#6ec9ff','#ffcd57','#a895ff','#ff8768'];
+const uid=()=>crypto.randomBytes(7).toString('hex');
+const code=()=>Array.from(crypto.randomBytes(4),b=>'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[b%32]).join('');
+const online=r=>r.players.filter(p=>p.bot||p.ws?.readyState===WebSocket.OPEN);
+const human=p=>!p.bot&&p.ws?.readyState===WebSocket.OPEN;
+const send=(ws,msg)=>{if(ws?.readyState===WebSocket.OPEN)ws.send(JSON.stringify(msg))};
+const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
+const random=(a,b)=>a+Math.random()*(b-a);
+const dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+const addFeed=(r,text)=>{r.feed.push({text,id:uid()});r.feed=r.feed.slice(-7)};
+const say=(r,payload)=>{for(const p of r.players)if(human(p))send(p.ws,payload)};
+function coin(r){let x,y;let tries=0;do{x=random(38,W-38);y=random(38,H-38);tries++}while(tries<30&&r.players.some(p=>Math.hypot(p.x-x,p.y-y)<70));return {id:uid(),x,y,gold:Math.random()<.19}}
+function createRoom(owner,name,solo){
+ let c=code();while(rooms.has(c))c=code();
+ const r={code:c,phase:'lobby',players:[],coins:[],feed:[],round:0,endsAt:0,startsAt:0,winner:null,solo,createdAt:Date.now()};
+ rooms.set(c,r);addPlayer(r,owner,name,false);
+ if(solo)for(let i=0;i<3;i++)addPlayer(r,null,names[i],true);
+ return r;
 }
-function publish(r){
+function addPlayer(r,ws,name,bot){
+ const n=r.players.length,p={id:uid(),name:String(name||'Player').replace(/[<>]/g,'').slice(0,18),bot,
+ color:colors[n%colors.length],x:70,y:70,vx:0,vy:0,input:{x:0,y:0},score:0,kos:0,combo:0,lastCoin:0,dashUntil:0,dashReady:0,dashHits:[],stunUntil:0,invulnUntil:0,ws};
+ r.players.push(p);if(ws){ws.room=r.code;ws.pid=p.id}return p;
+}
+function detail(r){return {type:'state',code:r.code,phase:r.phase,round:r.round,solo:r.solo,
+ players:r.players.map(p=>({id:p.id,name:p.name,bot:p.bot,color:p.color,score:p.score,kos:p.kos,online:p.bot||human(p)})),
+ readyCount:online(r).length,endsAt:r.endsAt,feed:r.feed,winner:r.winner,host:r.players.find(p=>!p.bot)?.id};}
+function snapshot(r){
+ const basic=detail(r);
+ const state={...basic,type:'frame',players:r.players.map(p=>({id:p.id,name:p.name,bot:p.bot,color:p.color,x:Math.round(p.x),y:Math.round(p.y),score:p.score,kos:p.kos,combo:p.combo,dashing:p.dashUntil>Date.now(),stunned:p.stunUntil>Date.now(),cooldown:Math.max(0,p.dashReady-Date.now())})),coins:r.coins,remaining:Math.max(0,r.endsAt-Date.now())};
+ say(r,state);
+}
+function announce(r){say(r,detail(r))}
+function spawn(p){p.x=random(70,W-70);p.y=random(70,H-70);p.input={x:0,y:0};p.vx=0;p.vy=0;p.stunUntil=0;p.dashUntil=0;p.dashReady=0;p.dashHits=[];p.score=0;p.combo=0;p.kos=0;p.lastCoin=0;}
+function start(r){
+ if(online(r).length<2)return false;
+ r.round++;r.phase='playing';r.winner=null;r.startsAt=Date.now();r.endsAt=r.startsAt+LIMIT;
+ r.coins=Array.from({length:20},()=>coin(r));r.feed=[];
+ for(const p of r.players)spawn(p);
+ addFeed(r,'ROUND '+r.round+' — GRAB. DASH. STEAL. WIN.');
+ snapshot(r);return true;
+}
+function finish(r){
+ if(r.phase!=='playing')return;
+ r.phase='results';const ranks=[...r.players].sort((a,b)=>b.score-a.score||b.kos-a.kos);
+ r.winner=ranks[0]?{id:ranks[0].id,name:ranks[0].name,score:ranks[0].score}:null;
+ addFeed(r,(r.winner?.name||'Nobody')+' wins the arena!');snapshot(r);
+}
+function dash(p,r,now){
+ if(r.phase!=='playing'||now<p.dashReady||now<p.stunUntil)return;
+ let x=clamp(p.input.x,-1,1),y=clamp(p.input.y,-1,1),len=Math.hypot(x,y);
+ if(len<.15){x=1;y=0;len=1}
+ p.vx=x/len;p.vy=y/len;p.dashUntil=now+270;p.dashReady=now+3700;p.dashHits=[];
+}
+function botThink(r,p,now){
+ const rival=r.players.filter(a=>a!==p&&a.score>p.score+20).sort((a,b)=>dist(p,a)-dist(p,b))[0];
+ let target=null;
+ if(rival&&dist(p,rival)<125&&now>=p.dashReady){target=rival}
+ if(!target)target=[...r.coins].sort((a,b)=>(dist(p,a)-(a.gold?65:0))-(dist(p,b)-(b.gold?65:0)))[0];
+ if(!target)return;
+ const dx=target.x-p.x,dy=target.y-p.y,n=Math.hypot(dx,dy)||1;
+ p.input={x:dx/n,y:dy/n};
+ if(rival&&target===rival&&dist(p,rival)<105&&now>=p.dashReady)dash(p,r,now);
+ else if(dist(p,target)>160&&now>=p.dashReady&&Math.random()<.045)dash(p,r,now);
+}
+function simulation(r,now){
+ if(r.phase!=='playing')return;
+ if(now>=r.endsAt){finish(r);return}
  for(const p of r.players){
- if(!p.ws||p.ws.readyState!==WebSocket.OPEN)continue;
- const runner=p.id===r.runnerId;
- const sector=p.id===r.runnerId?-1:r.players.filter(q=>q.id!==r.runnerId).findIndex(q=>q.id===p.id);
- const view=r.grid?.map((row,y)=>row.map((v,x)=>{
- if(r.phase!=='playing')return v;
- if(runner)return Math.abs(x-r.position[0])+Math.abs(y-r.position[1])<=2?v:-1;
- return ((x+y+sector*4)%9<6)?v:-1;
- }));
- send(p,{type:'state',code:r.code,me:p.id,hostId:r.hostId,runnerId:r.runnerId,players:r.players.map(({id,name,score,ws,bot})=>({id,name,score,bot:!!bot,online:!!bot||!!ws&&ws.readyState===WebSocket.OPEN})),
- phase:r.phase,solo:!!r.solo,grid:view,position:r.position,exit:r.exit,fragments:r.fragments,found:r.found,beacons:r.beacons,messages:r.messages,endsAt:r.endsAt,result:r.result,round:r.round,role:runner?'RUNNER':'SCOUT',score:p.score});
- }
-}
-function finish(r,won,reason){if(r.phase!=='playing')return;r.phase='result';r.result={won,reason};if(won){const pts=Math.max(100,Math.floor((r.endsAt-Date.now())/1000)*10);for(const p of r.players)p.score+=pts;note(r,'Mission completed. +' + pts + ' points for the crew!')}else note(r,'Mission failed: '+reason);publish(r)}
-
-function shortestRoute(grid,from,to){
- const visited=new Set([from.join(',')]);
- const queue=[[from]];
- for(let head=0;head<queue.length;head++){
-  const route=queue[head],p=route[route.length-1];
-  if(p[0]===to[0]&&p[1]===to[1])return route;
-  for(const [dx,dy] of [[0,-1],[1,0],[0,1],[-1,0]]){
-   const x=p[0]+dx,y=p[1]+dy,key=x+','+y;
-   if(grid[y]?.[x]!==0||visited.has(key))continue;
-   visited.add(key);queue.push([...route,[x,y]]);
+  if(p.bot)botThink(r,p,now);
+  if(now<p.stunUntil)continue;
+  const d=now<p.dashUntil,n=Math.hypot(p.input.x,p.input.y)||1,spd=d?630:185;
+  const vx=d?p.vx:p.input.x/n,vy=d?p.vy:p.input.y/n;
+  p.x=clamp(p.x+vx*spd*TICK/1000,18,W-18);
+  p.y=clamp(p.y+vy*spd*TICK/1000,18,H-18);
+  for(let i=r.coins.length-1;i>=0;i--){
+   const c=r.coins[i];if(Math.hypot(p.x-c.x,p.y-c.y)>21)continue;
+   const combo=now-p.lastCoin<2300?Math.min(p.combo+1,5):1;
+   p.combo=combo;p.lastCoin=now;p.score+=(c.gold?25:10)+(combo>=3?5:0);
+   if(c.gold)addFeed(r,p.name+' snatched a GOLD +25!');
+   else if(combo===4)addFeed(r,p.name+' is on a 4x streak!');
+   r.coins.splice(i,1);r.coins.push(coin(r));
+  }
+  if(!d)continue;
+  for(const target of r.players){
+   if(target===p||p.dashHits.includes(target.id)||now<target.invulnUntil||dist(p,target)>33)continue;
+   p.dashHits.push(target.id);
+   const stolen=Math.min(30,target.score);
+   const bonus=target.score>=p.score?20:10;
+   target.score-=stolen;p.score+=stolen+bonus;p.kos++;
+   target.stunUntil=now+350;target.invulnUntil=now+1100;
+   const dx=target.x-p.x,dy=target.y-p.y,len=Math.hypot(dx,dy)||1;
+   target.x=clamp(target.x+dx/len*35,18,W-18);
+   target.y=clamp(target.y+dy/len*35,18,H-18);
+   addFeed(r,p.name+' tagged '+target.name+'! +'+(stolen+bonus));
   }
  }
- return null;
+ snapshot(r);
 }
-function guideSolo(r,force=false){
- if(!r.solo||r.phase!=='playing')return;
- const pending=r.fragments.filter((_,i)=>!r.found.includes(i));
- const goals=pending.length?pending:[r.exit];
- const routes=goals.map(goal=>shortestRoute(r.grid,r.position,goal)).filter(Boolean);
- routes.sort((a,b)=>a.length-b.length);
- const route=routes[0];
- if(!route||route.length<2)return;
- const [nx,ny]=route[1],[x,y]=r.position;
- const direction=nx>x?'RIGHT':nx<x?'LEFT':ny>y?'DOWN':'UP';
- const objective=pending.length?'SIGNAL '+(r.found.length+1)+'/3':'EXIT';
- const marker=r.beacons.find(b=>b.bot);
- if(marker){marker.x=nx;marker.y=ny;marker.until=Date.now()+12000}
- else r.beacons.push({x:nx,y:ny,name:'VECTOR 🤖',bot:true,until:Date.now()+12000});
- r.botSteps=(r.botSteps||0)+1;
- const advice=direction+' toward '+objective+'. Follow the orange beacon!';
- if(force||advice!==r.botAdvice||r.botSteps%3===0){
-  r.messages.push({name:'ECHO 🤖',text:advice});
-  r.messages=r.messages.slice(-30);
-  r.botAdvice=advice;
- }
-}
-function start(r){
- if(online(r).length+bots(r).length<2)return false;
- const m=maze();r.grid=m.grid;r.exit=m.exit;r.fragments=m.fragments;r.found=[];r.position=[1,1];r.beacons=[];r.phase='playing';r.endsAt=Date.now()+ROUND;r.result=null;r.round++;r.runnerId=online(r)[(r.round-1)%online(r).length].id;r.botSteps=0;r.botAdvice='';
- note(r,r.solo?'SOLO PRACTICE: ECHO and VECTOR are your bot Scouts. Follow their clues!':'Mission launched! Collect the signals and reach the exit.');
- guideSolo(r,true);publish(r);return true;
-}
-function join(ws,m){
- const code=String(m.code||'').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,4);
- const name=String(m.name||'Player').replace(/[<>]/g,'').trim().slice(0,18)||'Player';
- const r=rooms.get(code);if(!r)return ws.send(JSON.stringify({type:'error',message:'Room not found'}));
- let p=r.players.find(p=>p.id===m.id);if(!p){if(r.players.length>=6)return ws.send(JSON.stringify({type:'error',message:'Room is full'}));p={id:id(),name,score:0,ws:null};r.players.push(p);}
- if(p.ws&&p.ws!==ws)try{p.ws.close()}catch{}
- p.ws=ws;p.name=name;ws.room=code;ws.pid=p.id;if(!r.hostId||!r.players.find(t=>t.id===r.hostId&&t.ws))r.hostId=p.id;
- ws.send(JSON.stringify({type:'joined',code,id:p.id,name}));note(r,name+' joined the crew');publish(r);
-}
+const root=path.join(__dirname,'public');
+const files={'/':'index.html','/index.html':'index.html'};
+const server=http.createServer((req,res)=>{
+ const pathname=new URL(req.url,'http://localhost').pathname;
+ if(pathname==='/healthz'){res.writeHead(200,{'Content-Type':'application/json'});return res.end(JSON.stringify({ok:true,game:'NEON HEIST',rooms:rooms.size}))}
+ const file=files[pathname];if(!file){res.writeHead(404);return res.end('Not found')}
+ fs.readFile(path.join(root,file),(err,data)=>{if(err){res.writeHead(500);return res.end('Missing game client')}res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-cache'});res.end(data)})
+});
+const wss=new WebSocketServer({server,path:'/ws'});
 wss.on('connection',ws=>{
- ws.on('message',raw=>{
- let m;try{if(raw.length>8192)return;m=JSON.parse(raw.toString())}catch{return}
- if(m.type==='create'){
- let code=randomCode();while(rooms.has(code))code=randomCode();
- rooms.set(code,{code,hostId:null,runnerId:null,players:[],solo:!!m.solo,phase:'lobby',grid:null,round:0,found:[],fragments:[],beacons:[],messages:[],endsAt:0,result:null});
- join(ws,{...m,code});
- if(m.solo){const r=rooms.get(code);r.players.push({id:'bot-'+id(),name:'ECHO 🤖',score:0,ws:null,bot:true},{id:'bot-'+id(),name:'VECTOR 🤖',score:0,ws:null,bot:true});start(r)}
- return;
- }
- if(m.type==='join'){join(ws,m);return}
- const r=rooms.get(ws.room);if(!r)return;
- const p=r.players.find(q=>q.id===ws.pid);if(!p||p.ws!==ws)return;
- if(m.type==='leave'){p.ws=null;ws.room=null;ws.pid=null;publish(r);return}
- if(m.type==='chat'){const text=String(m.text||'').trim().slice(0,180);if(text){r.messages.push({name:p.name,text});r.messages=r.messages.slice(-30);publish(r)}}
- else if(m.type==='start'&&p.id===r.hostId&&r.phase!=='playing')start(r);
- else if(m.type==='move'&&r.phase==='playing'&&p.id===r.runnerId){
-  const d={up:[0,-1],down:[0,1],left:[-1,0],right:[1,0]}[m.dir];if(!d)return;
-  const x=r.position[0]+d[0],y=r.position[1]+d[1];if(r.grid[y]?.[x]!==0){send(p,{type:'bump'});return}
-  r.position=[x,y];const ix=r.fragments.findIndex(q=>q[0]===x&&q[1]===y);
-  if(ix!==-1&&!r.found.includes(ix)){r.found.push(ix);note(r,'Signal fragment secured ('+r.found.length+'/3)')}
-  if(x===r.exit[0]&&y===r.exit[1]&&r.found.length===3)finish(r,true,'Escaped!');
-  else {guideSolo(r,ix!==-1);publish(r)}
- }
- else if(m.type==='beacon'&&r.phase==='playing'&&p.id!==r.runnerId){
-  const x=Number(m.x),y=Number(m.y);
-  if(Number.isInteger(x)&&Number.isInteger(y)&&x>=0&&y>=0&&x<SIZE&&y<SIZE){r.beacons.push({x,y,name:p.name,until:Date.now()+9000});r.beacons=r.beacons.slice(-20);publish(r)}
- }
+ ws.isAlive=true;ws.on('pong',()=>{ws.isAlive=true});
+ ws.on('message',buffer=>{
+  if(buffer.length>2048)return;
+  let m;try{m=JSON.parse(buffer.toString())}catch{return}
+  if(!m||typeof m!=='object')return;
+  if(m.type==='create'){
+   if(ws.room)return;
+   const r=createRoom(ws,String(m.name||'Player'),!!m.solo);
+   const p=r.players[0];send(ws,{type:'joined',code:r.code,id:p.id});
+   if(r.solo)start(r);else announce(r);return;
+  }
+  if(m.type==='join'){
+   if(ws.room)return;
+   const c=String(m.code||'').toUpperCase(),r=rooms.get(c);
+   if(!r)return send(ws,{type:'error',message:'Room not found'});
+   let p=r.players.find(v=>v.id===m.id&&!v.bot);
+   if(p){if(p.ws&&p.ws!==ws){try{p.ws.close()}catch{}}p.ws=ws;ws.room=c;ws.pid=p.id}
+   else{if(r.phase!=='lobby')return send(ws,{type:'error',message:'Round already running'});
+    if(r.players.length>=6)return send(ws,{type:'error',message:'Room is full'});
+    p=addPlayer(r,ws,String(m.name||'Player'),false)}
+   send(ws,{type:'joined',code:c,id:p.id});if(r.phase==='playing'||r.phase==='results')snapshot(r);else announce(r);return;
+  }
+  const r=rooms.get(ws.room),p=r?.players.find(v=>v.id===ws.pid);
+  if(!r||!p||p.ws!==ws)return;
+  if(m.type==='start'&&r.phase!=='playing'&&r.players.find(v=>!v.bot)?.id===p.id){start(r);return}
+  if(m.type==='input'){p.input={x:clamp(Number(m.x)||0,-1,1),y:clamp(Number(m.y)||0,-1,1)};return}
+  if(m.type==='dash'){dash(p,r,Date.now());return}
+  if(m.type==='leave'){p.ws=null;ws.room=null;ws.pid=null;announce(r)}
  });
  ws.on('close',()=>{
-  const r=rooms.get(ws.room);if(!r)return;const p=r.players.find(t=>t.id===ws.pid);
-  if(p&&p.ws===ws)p.ws=null;
-  if(r.hostId===ws.pid)r.hostId=online(r)[0]?.id||null;
-  if(r.phase==='playing'&&r.runnerId===ws.pid){const other=online(r)[0];if(other){r.runnerId=other.id;note(r,other.name+' is now Runner')}else finish(r,false,'Crew disconnected')}
-  publish(r);
+  const r=rooms.get(ws.room),p=r?.players.find(v=>v.id===ws.pid);
+  if(p&&p.ws===ws){p.ws=null;p.input={x:0,y:0};if(r.phase==='lobby')r.players=r.players.filter(x=>x.bot||human(x));announce(r)}
  });
 });
-setInterval(()=>{for(const [code,r] of rooms){
- if(r.phase==='playing'&&Date.now()>=r.endsAt)finish(r,false,'Time expired');
- const beforeBeacons=r.beacons.length;
- if(beforeBeacons)r.beacons=r.beacons.filter(b=>b.until>Date.now());
- if(!online(r).length&&r.phase!=='playing')rooms.delete(code);
- else if(r.phase==='playing'&&r.beacons.length!==beforeBeacons)publish(r);
-}},1000).unref();
-server.listen(PORT,'0.0.0.0',()=>console.log('BLINDSPOT online port '+PORT));
+setInterval(()=>{const now=Date.now();for(const [key,r] of rooms){
+ if(r.phase==='playing')simulation(r,now);
+ if(!r.players.some(human)&&now-r.createdAt>180000)rooms.delete(key);
+}},TICK).unref();
+setInterval(()=>{for(const ws of wss.clients){if(ws.isAlive===false){ws.terminate();continue}ws.isAlive=false;ws.ping()}},25000).unref();
+server.listen(PORT,'0.0.0.0',()=>console.log('NEON HEIST ready on '+PORT));
